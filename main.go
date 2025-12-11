@@ -2,57 +2,72 @@ package main
 
 import (
 "bytes"
+"encoding/binary"
 "fmt"
 "log"
 "net"
-"net/http"
 "os"
 "os/exec"
 "os/signal"
-"sync"
 "syscall"
 )
 
 const (
-port    = 8080
-monitor = "HEADLESS-2"
-quality = 70
-)
-
-var (
-currentFrame []byte
-frameMu      sync.RWMutex
+udpPort   = 9999
+monitor   = "HEADLESS-2"
+quality   = 60
+maxPacket = 60000
 )
 
 func main() {
 sigChan := make(chan os.Signal, 1)
 signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-go captureLoop()
+addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", udpPort))
+if err != nil {
+log.Fatal(err)
+}
 
-http.HandleFunc("/", serveHTML)
-http.HandleFunc("/frame.jpg", handleFrame)
+conn, err := net.ListenUDP("udp", addr)
+if err != nil {
+log.Fatal(err)
+}
+defer conn.Close()
 
 ip := getLocalIP()
 fmt.Println("=============================================")
-fmt.Println("  SANAL MONİTÖR PAYLAŞIMI")
+fmt.Println("  UDP SCREEN SHARE")
 fmt.Println("=============================================")
 fmt.Printf("  Monitör: %s\n", monitor)
-fmt.Printf("  Adres: http://%s:%d\n", ip, port)
+fmt.Printf("  UDP: %s:%d\n", ip, udpPort)
 fmt.Printf("  Kalite: %d%%\n", quality)
 fmt.Println("=============================================")
 
+clients := make(map[string]*net.UDPAddr)
+
+// Client listener
 go func() {
-<-sigChan
-fmt.Println("\nKapatılıyor...")
-os.Exit(0)
+buf := make([]byte, 64)
+for {
+n, clientAddr, err := conn.ReadFromUDP(buf)
+if err != nil {
+continue
+}
+msg := string(buf[:n])
+if msg == "CONNECT" {
+clients[clientAddr.String()] = clientAddr
+fmt.Printf("+ Client: %s\n", clientAddr.String())
+} else if msg == "DISCONNECT" {
+delete(clients, clientAddr.String())
+fmt.Printf("- Client: %s\n", clientAddr.String())
+}
+}
 }()
 
-log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", port), nil))
-}
-
-func captureLoop() {
+// Capture loop
+go func() {
 var buf bytes.Buffer
+var frameNum uint32 = 0
 
 for {
 buf.Reset()
@@ -60,49 +75,49 @@ buf.Reset()
 cmd := exec.Command("grim", "-o", monitor, "-t", "jpeg", "-q", fmt.Sprintf("%d", quality), "-")
 cmd.Stdout = &buf
 
-if err := cmd.Run(); err == nil && buf.Len() > 0 {
-data := make([]byte, buf.Len())
-copy(data, buf.Bytes())
-
-frameMu.Lock()
-currentFrame = data
-frameMu.Unlock()
-}
-}
+if err := cmd.Run(); err != nil || buf.Len() == 0 {
+continue
 }
 
-func handleFrame(w http.ResponseWriter, r *http.Request) {
-frameMu.RLock()
-frame := currentFrame
-frameMu.RUnlock()
+frameNum++
+data := buf.Bytes()
 
-if len(frame) == 0 {
-http.Error(w, "Frame yok", 503)
-return
+for _, addr := range clients {
+sendFrame(conn, addr, frameNum, data)
+}
+}
+}()
+
+go func() {
+<-sigChan
+fmt.Println("\nKapatılıyor...")
+os.Exit(0)
+}()
+
+select {}
 }
 
-w.Header().Set("Content-Type", "image/jpeg")
-w.Header().Set("Cache-Control", "no-store")
-w.Write(frame)
+func sendFrame(conn *net.UDPConn, addr *net.UDPAddr, frameNum uint32, data []byte) {
+total := len(data)
+packets := (total + maxPacket - 1) / maxPacket
+
+for i := 0; i < packets; i++ {
+start := i * maxPacket
+end := start + maxPacket
+if end > total {
+end = total
 }
 
-func serveHTML(w http.ResponseWriter, r *http.Request) {
-html := `<!DOCTYPE html>
-<html><head><title>2. Ekran</title>
-<style>*{margin:0;padding:0}body{background:#000}img{width:100vw;height:100vh;object-fit:contain}</style>
-</head><body><img id="s"><script>
-const s=document.getElementById('s');
-let l=false;
-setInterval(()=>{
-  if(l)return;l=true;
-  const i=new Image();
-  i.onload=()=>{s.src=i.src;l=false;};
-  i.onerror=()=>l=false;
-  i.src='/frame.jpg?'+Date.now();
-},33);
-</script></body></html>`
-w.Header().Set("Content-Type", "text/html")
-w.Write([]byte(html))
+// Header: frame(4) + idx(2) + count(2) + size(4) = 12 bytes
+hdr := make([]byte, 12)
+binary.BigEndian.PutUint32(hdr[0:4], frameNum)
+binary.BigEndian.PutUint16(hdr[4:6], uint16(i))
+binary.BigEndian.PutUint16(hdr[6:8], uint16(packets))
+binary.BigEndian.PutUint32(hdr[8:12], uint32(total))
+
+pkt := append(hdr, data[start:end]...)
+conn.WriteToUDP(pkt, addr)
+}
 }
 
 func getLocalIP() string {
