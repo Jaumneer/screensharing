@@ -2,91 +2,45 @@ package main
 
 import (
 "bytes"
-"encoding/binary"
 "fmt"
 "log"
 "net"
+"net/http"
 "os"
 "os/exec"
 "os/signal"
+"sync"
 "syscall"
 )
 
 const (
-udpPort   = 9999
-monitor   = "HEADLESS-2"
-quality   = 60
-maxPacket = 60000
+port    = 8080
+monitor = "HEADLESS-2"
+quality = 65
+)
+
+var (
+frame   []byte
+frameMu sync.RWMutex
 )
 
 func main() {
 sigChan := make(chan os.Signal, 1)
 signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", udpPort))
-if err != nil {
-log.Fatal(err)
-}
+go captureLoop()
 
-conn, err := net.ListenUDP("udp", addr)
-if err != nil {
-log.Fatal(err)
-}
-defer conn.Close()
+http.HandleFunc("/frame.jpg", handleFrame)
+http.HandleFunc("/", serveHTML)
 
 ip := getLocalIP()
 fmt.Println("=============================================")
-fmt.Println("  UDP SCREEN SHARE")
+fmt.Println("  HTTP SCREEN SHARE")
 fmt.Println("=============================================")
 fmt.Printf("  Monitör: %s\n", monitor)
-fmt.Printf("  UDP: %s:%d\n", ip, udpPort)
+fmt.Printf("  URL: http://%s:%d\n", ip, port)
 fmt.Printf("  Kalite: %d%%\n", quality)
 fmt.Println("=============================================")
-
-clients := make(map[string]*net.UDPAddr)
-
-// Client listener
-go func() {
-buf := make([]byte, 64)
-for {
-n, clientAddr, err := conn.ReadFromUDP(buf)
-if err != nil {
-continue
-}
-msg := string(buf[:n])
-if msg == "CONNECT" {
-clients[clientAddr.String()] = clientAddr
-fmt.Printf("+ Client: %s\n", clientAddr.String())
-} else if msg == "DISCONNECT" {
-delete(clients, clientAddr.String())
-fmt.Printf("- Client: %s\n", clientAddr.String())
-}
-}
-}()
-
-// Capture loop
-go func() {
-var buf bytes.Buffer
-var frameNum uint32 = 0
-
-for {
-buf.Reset()
-
-cmd := exec.Command("grim", "-o", monitor, "-t", "jpeg", "-q", fmt.Sprintf("%d", quality), "-")
-cmd.Stdout = &buf
-
-if err := cmd.Run(); err != nil || buf.Len() == 0 {
-continue
-}
-
-frameNum++
-data := buf.Bytes()
-
-for _, addr := range clients {
-sendFrame(conn, addr, frameNum, data)
-}
-}
-}()
 
 go func() {
 <-sigChan
@@ -94,30 +48,55 @@ fmt.Println("\nKapatılıyor...")
 os.Exit(0)
 }()
 
-select {}
+log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", port), nil))
 }
 
-func sendFrame(conn *net.UDPConn, addr *net.UDPAddr, frameNum uint32, data []byte) {
-total := len(data)
-packets := (total + maxPacket - 1) / maxPacket
+func captureLoop() {
+var buf bytes.Buffer
 
-for i := 0; i < packets; i++ {
-start := i * maxPacket
-end := start + maxPacket
-if end > total {
-end = total
+for {
+buf.Reset()
+
+cmd := exec.Command("grim", "-o", monitor, "-t", "jpeg", "-q", fmt.Sprintf("%d", quality), "-")
+cmd.Stdout = &buf
+
+if err := cmd.Run(); err == nil && buf.Len() > 0 {
+data := make([]byte, buf.Len())
+copy(data, buf.Bytes())
+
+frameMu.Lock()
+frame = data
+frameMu.Unlock()
+}
+}
 }
 
-// Header: frame(4) + idx(2) + count(2) + size(4) = 12 bytes
-hdr := make([]byte, 12)
-binary.BigEndian.PutUint32(hdr[0:4], frameNum)
-binary.BigEndian.PutUint16(hdr[4:6], uint16(i))
-binary.BigEndian.PutUint16(hdr[6:8], uint16(packets))
-binary.BigEndian.PutUint32(hdr[8:12], uint32(total))
+func handleFrame(w http.ResponseWriter, r *http.Request) {
+frameMu.RLock()
+data := frame
+frameMu.RUnlock()
 
-pkt := append(hdr, data[start:end]...)
-conn.WriteToUDP(pkt, addr)
+if len(data) == 0 {
+http.Error(w, "No frame", 503)
+return
 }
+
+w.Header().Set("Content-Type", "image/jpeg")
+w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+w.Header().Set("Connection", "keep-alive")
+w.Write(data)
+}
+
+func serveHTML(w http.ResponseWriter, r *http.Request) {
+html := `<!DOCTYPE html><html><head><title>Screen</title>
+<style>*{margin:0;padding:0}body{background:#000}img{width:100vw;height:100vh;object-fit:contain}</style>
+</head><body><img id="s"><script>
+const s=document.getElementById('s');let n=0;
+function f(){const i=new Image();i.onload=()=>{s.src=i.src;n++;requestAnimationFrame(f);};i.onerror=()=>setTimeout(f,50);i.src='/frame.jpg?'+Date.now();}
+f();setInterval(()=>{document.title=n+' FPS';n=0;},1000);
+</script></body></html>`
+w.Header().Set("Content-Type", "text/html")
+w.Write([]byte(html))
 }
 
 func getLocalIP() string {
